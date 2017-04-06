@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import subprocess
+import json
+import sys
+
+DMCTAB_DEFAULT='/etc/dmctab'
+
+def execute(args):
+    return subprocess.call(args)
+
+
+def popen(args):
+    rv = subprocess.Popen(args,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+    rv.wait()
+    if rv.returncode == 0:
+        return rv.stdout.read()
+    raise Exception(rv.stderr.read().decode())
+
+
+def sfdisk(dev,payload):
+    args = ['sfdisk',dev]
+    rv = subprocess.Popen(args,
+                          stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+    (stdout,stderr) = rv.communicate(input=payload.encode())
+    return stdout.decode()
+
+def blockdev_getsz(dev):
+    args = ['blockdev','--getsz',dev]
+    return int(popen(args))
+
+
+def dmsetup(args):
+    args = ['dmsetup'] + args
+    print(' '.join(args))
+    return popen(args)
+
+
+def dmsetup_table(name):
+    args = ['dmsetup','table',name]
+    return popen(args).decode().split()
+
+
+def build_dm_cache_table(origin_dev,origin_size,metadata_dev,cache_dev,blocksize,mode):
+    return ('0 %s cache %s %s %s %s 1 %s default 0'
+            % (origin_size,metadata_dev,cache_dev,origin_dev,blocksize,mode))
+
+
+def dmsetup_create_cache(name,origin_dev,metadata_dev,cache_dev,blocksize,mode):
+    origin_size = blockdev_getsz(origin_dev)
+    table = build_dm_cache_table(origin_dev,origin_size,
+                                 metadata_dev,cache_dev,
+                                 blocksize,mode)
+    return dmsetup(['create',name,'--table',table])
+
+
+def dmsetup_dev_exists(name):
+    args = ['dmsetup','info',name]
+    rv = subprocess.Popen(args,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+    rv.wait()
+    return rv.returncode == 0
+
+
+def skippable(line,names):
+    return ((not line) or
+            (line[0][0] == '#') or
+            (names and line[0] not in names))
+
+
+def parttable2sfdisk(parttable):
+    rv = 'label: gpt\n'
+    for (source,meta_pt,meta_size,data_pt,data_size) in parttable:
+        rv += '{} : size={}\n'.format(meta_pt,meta_size)
+        rv += '{} : size={}\n'.format(data_pt,data_size)
+    return rv
+
+
+def dev_uuid(dev):
+    args = ['blkid','-s','PARTUUID','-o','value',dev]
+    return popen(args).decode().rstrip()
+
+
+def parttable2dmctab(parttable,blocksize,mode):
+    rv = '# NAME METADATA_DEV CACHE_DEV ORIGIN_DEV BLOCKSIZE MODE\n'
+    for (source,metadev,_,datadev,_) in parttable:
+        basename = os.path.basename(source)
+        metauuid='/dev/disk/by-partuuid/'+dev_uuid(metadev)
+        datauuid='/dev/disk/by-partuuid/'+dev_uuid(datadev)
+        rv += '{} {} {} {} {} {}\n'.format(basename,metauuid,datauuid,source,blocksize,mode)
+    return rv
+
+
+def enable(line):
+    name         = line[0]
+    metadata_dev = line[1]
+    cache_dev    = line[2]
+    origin_dev   = line[3]
+    blocksize    = line[4]
+    mode         = line[5]
+
+    if dmsetup_dev_exists(name):
+        print('warning: %s already setup, skipping' % name)
+        return
+
+    dmsetup_create_cache(name,origin_dev,
+                         metadata_dev,cache_dev,
+                         blocksize,mode)
+
+
+def disable(line):
+    name         = line[0]
+    metadata_dev = line[1]
+    cache_dev    = line[2]
+    origin_dev   = line[3]
+    blocksize    = line[4]
+    mode         = line[5]
+
+    if not dmsetup_dev_exists(name):
+        print('warning: %s not currently setup, skipping' % name)
+        return
+
+    table = dmsetup_table(name)
+    if table[9] not in ['default','cleaner']:
+        print('warning: %s has unexpected policy %s , skipping' % (name,table[9]))
+        return
+
+    table[9] = 'cleaner'
+    dmsetup(['suspend',name])
+    dmsetup(['reload',name,'--table',' '.join(table)])
+    dmsetup(['resume',name])
+    dmsetup(['remove',name])
+
+
+def cmd_enable(args):
+    with open(args.dmctab) as file:
+        for line in file:
+            try:
+                line = line.split()
+                if skippable(line,args.name):
+                    continue
+                enable(line)
+            except Exception as e:
+                print('error: %s' % e,file=sys.stderr)
+
+
+def cmd_disable(args):
+    with open(args.dmctab) as file:
+        for line in file:
+            try:
+                line = line.split()
+                if skippable(line,args.name):
+                    continue
+                disable(line)
+            except Exception as e:
+                print('error: %s' % e,file=sys.stderr)
+
+
+def sizes_equal(target_size,sources):
+    size = int(target_size / len(sources))
+    return [(source,size) for source in sources]
+
+
+def sizes_proportional(target_size,sources):
+    sizes = []
+    total = 0
+    for source in sources:
+        size_in_bytes = blockdev_getsz(source) * 512
+        total += size_in_bytes
+        sizes.append((source,size_in_bytes))
+        rv = []
+    for (source,size_in_bytes) in sizes:
+        size_in_bytes = (size_in_bytes / total) * target_size
+        rv.append((source,int(size_in_bytes)))
+    return rv
+
+
+def round_sizes(extentsize,sizes):
+    return [(source,rounddown(size,extentsize))
+            for (source,size) in sizes]
+
+
+def roundup(n,x):
+    return n if (n % x == 0) else (n + x - (n % x))
+
+
+def rounddown(n,x):
+    return (n - (n % x))
+
+
+def partition_table(dev):
+    args = ['sfdisk','-J',dev]
+    stdout = popen(args)
+    return json.loads(stdout.decode())['partitiontable']
+
+
+def avail_sectors(dev):
+    parttable = partition_table(dev)
+    avail  = parttable['lastlba']
+    avail -= parttable['firstlba']
+    return avail
+
+
+def split_size(srcsize,extentsize,blocksize):
+    (source,size) = srcsize
+    metadata_size = ((4*1024*1024) + (16 * (size / (blocksize * 512))))
+    metadata_size = roundup(metadata_size,extentsize)
+    data_size = (size - metadata_size)
+    data_size = rounddown(data_size,extentsize)
+    metadata_size /= 512
+    data_size /= 512
+    return (source,int(metadata_size),int(data_size))
+
+
+def split_sizes(extentsize,blocksize,sizes):
+    return [split_size(size,extentsize,blocksize) for size in sizes]
+
+
+def cmd_make(args):
+    if not args.t or args.t == 'equal':
+        sizes_fun = sizes_equal
+    elif args.t == 'proportional':
+        sizes_fun = sizes_proportional
+
+    extentsize = (1 * 1024 * 1024)
+    freespace = avail_sectors(args.target) * 512
+
+    sizes = sizes_fun(freespace,args.sources)
+    sizes = round_sizes(extentsize,sizes)
+    sizes = split_sizes(extentsize,args.blocksize,sizes)
+
+    partnum = 1
+    parttable = []
+    for (source,metadata_size,data_size) in sizes:
+        meta_target = args.target + str(partnum)
+        data_target = args.target + str(partnum+1)
+        parttable.append((source,
+                          meta_target,metadata_size,
+                          data_target,data_size))
+        partnum += 2
+
+    sfdisk_input = parttable2sfdisk(parttable)
+    print(sfdisk_input)
+    if args.execute:
+        sfdisk_output = sfdisk(args.target,sfdisk_input)
+        print(sfdisk_output)
+
+        dmctab = parttable2dmctab(parttable,args.blocksize,args.mode)
+        with open(args.dmctab,'w') as f:
+            f.write(dmctab)
+
+    return
+
+
+def wipe_meta(dev):
+    args = ['dd','if=/dev/zero','of={}'.format(dev)]
+    print(' '.join(args))
+    execute(args)
+
+
+def cmd_wipe_meta(args):
+    with open(args.dmctab) as file:
+        for line in file:
+            try:
+                line = line.split()
+                if skippable(line,args.name):
+                    continue
+                dev = line[1]
+                rv = input('Do you wish to wipe {}? [y/N] '.format(dev))
+                if rv in ['y','Y']:
+                    wipe_meta(dev)
+            except Exception as e:
+                print('error: %s' % e,file=sys.stderr)
+
+
+def blocksize_type(x):
+    x = int(x)
+    if x % 64:
+        msg = 'must be a multiple of 64 (32KB)'
+        raise argparse.ArgumentTypeError(msg)
+    if ((x < 64) or (x > 2097152)):
+        msg = 'must be between 64 (32KB) and 2097152 (1GB)'
+        raise argparse.ArgumentTypeError(msg)
+    return x
+
+
+def build_arg_parser():
+    desc = ''
+    parser = argparse.ArgumentParser(description=desc)
+    subparsers = parser.add_subparsers(dest='command')
+
+    subparser = subparsers.add_parser('enable',
+                                      help='setup caches')
+    subparser.add_argument('-f',
+                           type=str,
+                           dest='dmctab',
+                           default=DMCTAB_DEFAULT,
+                           help='dmctab file to use (default: /etc/dmctab)')
+    subparser.add_argument('name',
+                           nargs='*',
+                           help='specific entries to enable')
+    subparser.set_defaults(func=cmd_enable)
+
+    subparser = subparsers.add_parser('disable',
+                                      help='tear down and flush caches')
+    subparser.add_argument('-f',
+                           type=str,
+                           dest='dmctab',
+                           default=DMCTAB_DEFAULT,
+                           help='dmctab file to use (default: /etc/dmctab)')
+    subparser.add_argument('name',
+                           nargs='*',
+                           help='specific entries to disable')
+    subparser.set_defaults(func=cmd_disable)
+
+    subparser = subparsers.add_parser('make',
+                                      help='create cache logical volumes and corresponding dmctab file')
+    subparser.add_argument('-t',
+                           type=str,
+                           choices=['equal','proportional'],
+                           help='how to split up cache space among input drives')
+    subparser.add_argument('-o',
+                           type=str,
+                           dest='dmctab',
+                           default=DMCTAB_DEFAULT,
+                           help='file to write dmctab to')
+    subparser.add_argument('-m',
+                           type=str,
+                           dest='mode',
+                           choices=['default','writeback','writethrough'],
+                           default='writeback',
+                           help='cache mode to use')
+    subparser.add_argument('-b',
+                           type=blocksize_type,
+                           dest='blocksize',
+                           default=512,
+                           help='cache block in 512b sectors (multiple of 64, default=512)')
+    subparser.add_argument('-e',
+                           action='store_true',
+                           default=False,
+                           dest='execute',
+                           help='execute commands to setup cache drive')
+    subparser.add_argument('target',
+                           type=str,
+                           help='cache drive')
+    subparser.add_argument('sources',
+                           type=str,
+                           nargs='+',
+                           help='origin devices')
+    subparser.set_defaults(func=cmd_make)
+
+    subparser = subparsers.add_parser('wipe-meta',
+                                      help='run after using \'make\' to zero out meta partitions')
+    subparser.add_argument('name',
+                           nargs='*',
+                           help='specific partition to wipe')
+    subparser.add_argument('-f',
+                           type=str,
+                           dest='dmctab',
+                           default=DMCTAB_DEFAULT,
+                           help='dmctab file to use (default: /etc/dmctab)')
+    subparser.set_defaults(func=cmd_wipe_meta)
+
+    return parser
+
+
+def main(argv):
+    parser = build_arg_parser()
+    args   = parser.parse_args()
+
+    if hasattr(args,'func'):
+        args.func(args)
+    else:
+        parser.print_help()
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv)
+    except Exception as e:
+        print('error: %s' % e,file=sys.stderr)
